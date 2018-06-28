@@ -9,6 +9,9 @@ import json
 import mimetypes
 import os
 
+#For quick demo hack TODO: remove me
+import psycopg2
+
 from ckan.common import config
 import paste.deploy.converters as converters
 from six import text_type
@@ -670,6 +673,30 @@ def user_update(context, data_dict):
 
     user = model_save.user_dict_save(data, context)
 
+    # TODO: remove hack to update API Key in CAS database
+    log.info('Updating Api Key in CAS Database')
+    sql = 'UPDATE users SET apikey = %s WHERE username = %s'
+    conn = None
+    updated_rows = 0
+    try:
+        log.info('apikey = ' + data['apikey'])
+        log.info('username = ' + data['name'])
+        log.info('connecting to cas')
+        conn = psycopg2.connect("dbname=casino_ar_prod_users user=cas_default password=casPWnasaace")
+        cur = conn.cursor()
+        log.info('connected')
+	cur.execute(sql, (data['apikey'], data['name']))
+        updated_rows = cur.rowcount
+        conn.commit()
+        log.info('user apikey updated')
+        cur.close()
+    except (Exception, psycopg2.DatabaseError) as error:
+        log.error(error)
+    finally:
+        if conn is not None:
+            conn.close()
+    #end hack
+
     activity_dict = {
             'user_id': user.id,
             'object_id': user.id,
@@ -700,6 +727,9 @@ def user_generate_apikey(context, data_dict):
     :returns: the updated user
     :rtype: dictionary
     '''
+    
+    logging.debug('user_generate_apikey called')
+
     model = context['model']
     user = context['user']
     session = context['session']
