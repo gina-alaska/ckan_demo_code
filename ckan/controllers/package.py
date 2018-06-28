@@ -9,12 +9,11 @@ import cgi
 from ckan.common import config
 from paste.deploy.converters import asbool
 import paste.fileapp
-from six import string_types, text_type
 
 import ckan.logic as logic
 import ckan.lib.base as base
-import ckan.lib.i18n as i18n
 import ckan.lib.maintain as maintain
+import ckan.lib.i18n as i18n
 import ckan.lib.navl.dictization_functions as dict_fns
 import ckan.lib.helpers as h
 import ckan.model as model
@@ -24,13 +23,16 @@ import ckan.lib.uploader as uploader
 import ckan.plugins as p
 import ckan.lib.render
 
-from ckan.common import OrderedDict, _, json, request, c, response
+import psycopg2
+
+from ckan.common import OrderedDict, _, json, request, c, g, response
 from home import CACHE_PARAMETERS
 
 log = logging.getLogger(__name__)
 
 render = base.render
 abort = base.abort
+redirect = base.redirect
 
 NotFound = logic.NotFound
 NotAuthorized = logic.NotAuthorized
@@ -46,7 +48,7 @@ lookup_package_plugin = ckan.lib.plugins.lookup_package_plugin
 
 
 def _encode_params(params):
-    return [(k, v.encode('utf-8') if isinstance(v, string_types) else str(v))
+    return [(k, v.encode('utf-8') if isinstance(v, basestring) else str(v))
             for k, v in params]
 
 
@@ -148,7 +150,7 @@ class PackageController(base.BaseController):
         c.query_error = False
         page = h.get_page_number(request.params)
 
-        limit = int(config.get('ckan.datasets_per_page', 20))
+        limit = g.datasets_per_page
 
         # most search operations should reset the page counter:
         params_nopage = [(k, v) for k, v in request.params.items()
@@ -163,8 +165,7 @@ class PackageController(base.BaseController):
 
         def remove_field(key, value=None, replace=None):
             return h.remove_url_param(key, value=value, replace=replace,
-                                      controller='package', action='search',
-                                      alternative_url=package_type)
+                                      controller='package', action='search')
 
         c.remove_field = remove_field
 
@@ -226,29 +227,15 @@ class PackageController(base.BaseController):
                        'user': c.user, 'for_view': True,
                        'auth_user_obj': c.userobj}
 
-            # Unless changed via config options, don't show other dataset
-            # types any search page. Potential alternatives are do show them
-            # on the default search page (dataset) or on one other search page
-            search_all_type = config.get(
-                                  'ckan.search.show_all_types', 'dataset')
-            search_all = False
-
-            try:
-                # If the "type" is set to True or False, convert to bool
-                # and we know that no type was specified, so use traditional
-                # behaviour of applying this only to dataset type
-                search_all = asbool(search_all_type)
-                search_all_type = 'dataset'
-            # Otherwise we treat as a string representing a type
-            except ValueError:
-                search_all = True
-
-            if not package_type:
-                package_type = 'dataset'
-
-            if not search_all or package_type != search_all_type:
+            if package_type and package_type != 'dataset':
                 # Only show datasets of this particular type
                 fq += ' +dataset_type:{type}'.format(type=package_type)
+            else:
+                # Unless changed via config options, don't show non standard
+                # dataset types on the default search page
+                if not asbool(
+                        config.get('ckan.search.show_all_types', 'False')):
+                    fq += ' +dataset_type:dataset'
 
             facets = OrderedDict()
 
@@ -260,7 +247,7 @@ class PackageController(base.BaseController):
                 'license_id': _('Licenses'),
                 }
 
-            for facet in h.facets():
+            for facet in g.facets:
                 if facet in default_facet_titles:
                     facets[facet] = default_facet_titles[facet]
                 else:
@@ -294,21 +281,23 @@ class PackageController(base.BaseController):
                 item_count=query['count'],
                 items_per_page=limit
             )
+            c.facets = query['facets']
             c.search_facets = query['search_facets']
             c.page.items = query['results']
-        except SearchQueryError as se:
+        except SearchQueryError, se:
             # User's search parameters are invalid, in such a way that is not
             # achievable with the web interface, so return a proper error to
             # discourage spiders which are the main cause of this.
             log.info('Dataset search query rejected: %r', se.args)
             abort(400, _('Invalid search query: {error_message}')
                   .format(error_message=str(se)))
-        except SearchError as se:
+        except SearchError, se:
             # May be bad input from the user, but may also be more serious like
             # bad code causing a SOLR syntax error, or a problem connecting to
             # SOLR
             log.error('Dataset search error: %r', se.args)
             c.query_error = True
+            c.facets = {}
             c.search_facets = {}
             c.page = h.Page(collection=[])
         except NotAuthorized:
@@ -318,12 +307,16 @@ class PackageController(base.BaseController):
         for facet in c.search_facets.keys():
             try:
                 limit = int(request.params.get('_%s_limit' % facet,
-                            int(config.get('search.facets.default', 10))))
+                                               g.facets_default_number))
             except ValueError:
                 abort(400, _('Parameter "{parameter_name}" is not '
                              'an integer').format(
                       parameter_name='_%s_limit' % facet))
             c.search_facets_limits[facet] = limit
+
+        maintain.deprecate_context_item(
+            'facets',
+            'Use `c.search_facets` instead.')
 
         self._setup_template_variables(context, {},
                                        package_type=package_type)
@@ -373,9 +366,9 @@ class PackageController(base.BaseController):
                 try:
                     date = h.date_str_to_datetime(revision_ref)
                     context['revision_date'] = date
-                except TypeError as e:
+                except TypeError, e:
                     abort(400, _('Invalid revision format: %r') % e.args)
-                except ValueError as e:
+                except ValueError, e:
                     abort(400, _('Invalid revision format: %r') % e.args)
         elif len(split) > 2:
             abort(400, _('Invalid revision format: %r') %
@@ -409,14 +402,11 @@ class PackageController(base.BaseController):
         try:
             return render(template,
                           extra_vars={'dataset_type': package_type})
-        except ckan.lib.render.TemplateNotFound as e:
-            msg = _(
-                "Viewing datasets of type \"{package_type}\" is "
-                "not supported ({file_!r}).".format(
-                    package_type=package_type,
-                    file_=e.message
-                )
-            )
+        except ckan.lib.render.TemplateNotFound:
+            msg = _("Viewing {package_type} datasets in {format} format is "
+                    "not supported (template file {file} not found).".format(
+                        package_type=package_type, format=format,
+                        file=template))
             abort(404, msg)
 
         assert False, "We should never get here"
@@ -465,7 +455,7 @@ class PackageController(base.BaseController):
                                id=c.pkg_dict['name']),
                 description=_(u'Recent changes to CKAN Dataset: ') +
                 (c.pkg_dict['title'] or ''),
-                language=text_type(i18n.get_lang()),
+                language=unicode(i18n.get_lang()),
             )
             for revision_dict in c.pkg_revisions:
                 revision_date = h.date_str_to_datetime(
@@ -589,15 +579,16 @@ class PackageController(base.BaseController):
                     get_action('resource_update')(context, data)
                 else:
                     get_action('resource_create')(context, data)
-            except ValidationError as e:
+                self.update_workspaces_layers(resource_id, data)
+            except ValidationError, e:
                 errors = e.error_dict
                 error_summary = e.error_summary
                 return self.resource_edit(id, resource_id, data,
                                           errors, error_summary)
             except NotAuthorized:
                 abort(403, _('Unauthorized to edit this resource'))
-            h.redirect_to(controller='package', action='resource_read', id=id,
-                          resource_id=resource_id)
+            redirect(h.url_for(controller='package', action='resource_read',
+                               id=id, resource_id=resource_id))
 
         pkg_dict = get_action('package_show')(context, {'id': id})
         if pkg_dict['state'].startswith('draft'):
@@ -642,6 +633,7 @@ class PackageController(base.BaseController):
             # we don't want to include save as it is part of the form
             del data['save']
             resource_id = data['id']
+            log.info('Resource id : ' + resource_id)
             del data['id']
 
             context = {'model': model, 'session': model.Session,
@@ -654,11 +646,12 @@ class PackageController(base.BaseController):
                         and key != 'resource_type'):
                     data_provided = True
                     break
-
+            
             if not data_provided and save_action != "go-dataset-complete":
                 if save_action == 'go-dataset':
                     # go to final stage of adddataset
-                    h.redirect_to(controller='package', action='edit', id=id)
+                    redirect(h.url_for(controller='package',
+                                       action='edit', id=id))
                 # see if we have added any resources
                 try:
                     data_dict = get_action('package_show')(context, {'id': id})
@@ -671,11 +664,10 @@ class PackageController(base.BaseController):
                     # no data so keep on page
                     msg = _('You must add at least one data resource')
                     # On new templates do not use flash message
-
-                    if asbool(config.get('ckan.legacy_templates')):
+                    if g.legacy_templates:
                         h.flash_error(msg)
-                        h.redirect_to(controller='package',
-                                      action='new_resource', id=id)
+                        redirect(h.url_for(controller='package',
+                                           action='new_resource', id=id))
                     else:
                         errors = {}
                         error_summary = {_('Error'): msg}
@@ -686,7 +678,8 @@ class PackageController(base.BaseController):
                 get_action('package_update')(
                     dict(context, allow_state_change=True),
                     dict(data_dict, state='active'))
-                h.redirect_to(controller='package', action='read', id=id)
+                redirect(h.url_for(controller='package',
+                                   action='read', id=id))
 
             data['package_id'] = id
             try:
@@ -695,7 +688,8 @@ class PackageController(base.BaseController):
                     get_action('resource_update')(context, data)
                 else:
                     get_action('resource_create')(context, data)
-            except ValidationError as e:
+                self.update_workspaces_layers(resource_id, data)
+            except ValidationError, e:
                 errors = e.error_dict
                 error_summary = e.error_summary
                 return self.new_resource(id, data, errors, error_summary)
@@ -710,17 +704,20 @@ class PackageController(base.BaseController):
                 get_action('package_update')(
                     dict(context, allow_state_change=True),
                     dict(data_dict, state='active'))
-                h.redirect_to(controller='package', action='read', id=id)
+                redirect(h.url_for(controller='package',
+                                   action='read', id=id))
             elif save_action == 'go-dataset':
                 # go to first stage of add dataset
-                h.redirect_to(controller='package', action='edit', id=id)
+                redirect(h.url_for(controller='package',
+                                   action='edit', id=id))
             elif save_action == 'go-dataset-complete':
                 # go to first stage of add dataset
-                h.redirect_to(controller='package', action='read', id=id)
+                redirect(h.url_for(controller='package',
+                                   action='read', id=id))
             else:
                 # add more resources
-                h.redirect_to(controller='package', action='new_resource',
-                              id=id)
+                redirect(h.url_for(controller='package',
+                                   action='new_resource', id=id))
 
         # get resources for sidebar
         context = {'model': model, 'session': model.Session,
@@ -915,7 +912,7 @@ class PackageController(base.BaseController):
                         url = h.url_for(controller='package',
                                         action='new_resource',
                                         id=pkg_dict['name'])
-                    h.redirect_to(url)
+                    redirect(url)
                 # Make sure we don't index this dataset
                 if request.params['save'] not in ['go-resource',
                                                   'go-metadata']:
@@ -932,23 +929,23 @@ class PackageController(base.BaseController):
                 url = h.url_for(controller='package',
                                 action='new_resource',
                                 id=pkg_dict['name'])
-                h.redirect_to(url)
+                redirect(url)
 
             self._form_save_redirect(pkg_dict['name'], 'new',
                                      package_type=package_type)
         except NotAuthorized:
             abort(403, _('Unauthorized to read package %s') % '')
-        except NotFound as e:
+        except NotFound, e:
             abort(404, _('Dataset not found'))
         except dict_fns.DataError:
             abort(400, _(u'Integrity Error'))
-        except SearchIndexError as e:
+        except SearchIndexError, e:
             try:
-                exc_str = text_type(repr(e.args))
+                exc_str = unicode(repr(e.args))
             except Exception:  # We don't like bare excepts
-                exc_str = text_type(str(e))
+                exc_str = unicode(str(e))
             abort(500, _(u'Unable to add package to search index.') + exc_str)
-        except ValidationError as e:
+        except ValidationError, e:
             errors = e.error_dict
             error_summary = e.error_summary
             if is_an_update:
@@ -986,17 +983,17 @@ class PackageController(base.BaseController):
                                      package_type=package_type)
         except NotAuthorized:
             abort(403, _('Unauthorized to read package %s') % id)
-        except NotFound as e:
+        except NotFound, e:
             abort(404, _('Dataset not found'))
         except dict_fns.DataError:
             abort(400, _(u'Integrity Error'))
-        except SearchIndexError as e:
+        except SearchIndexError, e:
             try:
-                exc_str = text_type(repr(e.args))
+                exc_str = unicode(repr(e.args))
             except Exception:  # We don't like bare excepts
-                exc_str = text_type(str(e))
+                exc_str = unicode(str(e))
             abort(500, _(u'Unable to update search index.') + exc_str)
-        except ValidationError as e:
+        except ValidationError, e:
             errors = e.error_dict
             error_summary = e.error_summary
             return self.edit(name_or_id, data_dict, errors, error_summary)
@@ -1019,7 +1016,7 @@ class PackageController(base.BaseController):
                                 id=pkgname)
             else:
                 url = h.url_for('{0}_read'.format(package_type), id=pkgname)
-        h.redirect_to(url)
+        redirect(url)
 
     def delete(self, id):
 
@@ -1060,13 +1057,9 @@ class PackageController(base.BaseController):
         try:
             if request.method == 'POST':
                 get_action('resource_delete')(context, {'id': resource_id})
+                self.delete_workspace_layer(resource_id)
                 h.flash_notice(_('Resource has been deleted.'))
-                pkg_dict = get_action('package_show')(None, {'id': id})
-                if pkg_dict['state'].startswith('draft'):
-                    h.redirect_to(controller='package', action='new_resource',
-                                  id=id)
-                else:
-                    h.redirect_to(controller='package', action='read', id=id)
+                h.redirect_to(controller='package', action='read', id=id)
             c.resource_dict = get_action('resource_show')(
                 context, {'id': resource_id})
             c.pkg_id = id
@@ -1177,9 +1170,9 @@ class PackageController(base.BaseController):
                 response.headers['Content-Type'] = content_type
             response.status = status
             return app_iter
-        elif 'url' not in rsc:
+        elif not 'url' in rsc:
             abort(404, _('No download is available'))
-        h.redirect_to(rsc['url'])
+        redirect(rsc['url'])
 
     def follow(self, id):
         '''Start following this dataset.'''
@@ -1278,7 +1271,8 @@ class PackageController(base.BaseController):
                     get_action('member_delete')(context, data_dict)
                 except NotFound:
                     abort(404, _('Group not found'))
-            h.redirect_to(controller='package', action='groups', id=id)
+            redirect(h.url_for(controller='package',
+                               action='groups', id=id))
 
         context['is_member'] = True
         users_groups = get_action('group_list_authz')(context, data_dict)
@@ -1439,7 +1433,7 @@ class PackageController(base.BaseController):
         # update resource should tell us early if the user has privilages.
         try:
             check_access('resource_update', context, {'id': resource_id})
-        except NotAuthorized as e:
+        except NotAuthorized, e:
             abort(403, _('User %r not authorized to edit %s') % (c.user, id))
 
         # get resource and package data
@@ -1479,29 +1473,29 @@ class PackageController(base.BaseController):
                     data = get_action('resource_view_update')(context, data)
                 else:
                     data = get_action('resource_view_create')(context, data)
-            except ValidationError as e:
-                # Could break preview if validation error
+            except ValidationError, e:
+                ## Could break preview if validation error
                 to_preview = False
                 errors = e.error_dict
                 error_summary = e.error_summary
             except NotAuthorized:
-                # This should never happen unless the user maliciously changed
-                # the resource_id in the url.
+                ## This should never happen unless the user maliciously changed
+                ## the resource_id in the url.
                 abort(403, _('Unauthorized to edit resource'))
             else:
                 if not to_preview:
-                    h.redirect_to(controller='package',
-                                  action='resource_views',
-                                  id=id, resource_id=resource_id)
+                    redirect(h.url_for(controller='package',
+                                       action='resource_views',
+                                       id=id, resource_id=resource_id))
 
-        # view_id exists only when updating
+        ## view_id exists only when updating
         if view_id:
             try:
                 old_data = get_action('resource_view_show')(context,
                                                             {'id': view_id})
                 data = data or old_data
                 view_type = old_data.get('view_type')
-                # might as well preview when loading good existing view
+                ## might as well preview when loading good existing view
                 if not errors:
                     to_preview = True
             except (NotFound, NotAuthorized):
@@ -1615,3 +1609,87 @@ class PackageController(base.BaseController):
         else:
             return render(preview_plugin.preview_template(context, data_dict),
                           extra_vars={'dataset_type': dataset_type})
+
+    def update_workspaces_layers(self, ckan_id, data=None):
+        # TODO: Expand the functionality and make this a plugin
+        log.info('Trying to insert resource into workspaces')
+        select_sql = "SELECT 1 FROM layers WHERE ckan_id = %s"
+        insert_sql = "INSERT INTO layers (name, category_id, url, created_at, updated_at, ckan_id) values (%s, %s, %s, now(), now(), %s)"
+        update_sql = "UPDATE layers SET name = %s, category_id = %s, url = %s, updated_at = now() WHERE ckan_id = %s"
+	select_category_sql = "SELECT id FROM categories WHERE name ilike %s"
+        # Sloppy query but will work for demo
+        select_resource_id_sql = "SELECT id FROM resource WHERE created = (SELECT max(created) FROM resource)"
+        conn = None
+        updated_rows = 0
+        
+        if ckan_id is not None :
+           try:
+               # resource id is null for newly created records so manually fetch them.
+               log.info('connecting to ckan_default')
+               conn = psycopg2.connect("dbname=ckan_default user=ckan_default password=ckanPASSpostgres")
+               cur = conn.cursor()
+               log.info('connected')
+               log.info('Searching for latest resource id')
+               cur.execute(select_resource_id_sql)
+               ckan_id = cur.fetchone()[0]
+               cur.close()
+           except (Exception, psycopg2.DatabaseError) as error:
+               log.error(error)
+           finally:
+               if conn is not None:
+                    conn.close()
+
+	try:
+            log.info('connecting to workspaces')
+            conn = psycopg2.connect("dbname=nasa-ace-web-prod user=workspace_default password=workspaceNasaAce")
+            cur = conn.cursor()
+            log.info('connected')
+            log.info('Searching for format : ' + data['format'])
+            cur.execute(select_category_sql, (data['format'],))
+            log.info('category search finished')
+            rows = cur.rowcount
+            if rows == 1 :
+                category = cur.fetchone()[0]
+                cur.execute(select_sql, (ckan_id,))
+                rows = cur.rowcount
+                if rows > 0 :
+                    log.info('executing update ')
+                    cur.execute(update_sql, (data['name'], category,  data['url'], ckan_id))
+                else :
+                    log.info('executing insert ')
+                    cur.execute(insert_sql, (data['name'], category, data['url'], ckan_id))
+                conn.commit()
+                log.info('workspace layer for ' + data['name'] + ' updated')
+            else :
+                log.info('catagory  not found')
+            cur.close()
+        except (Exception, psycopg2.DatabaseError) as error:
+            log.error(error)
+        finally:
+            if conn is not None:
+                conn.close()
+
+    def delete_workspace_layer(self, ckan_id):
+        log.info('delete workspace layer called')
+	delete_view_layer_sql = "DELETE FROM view_layers WHERE layer_id IN (SELECT id FROM layers WHERE ckan_id = %s)";
+        delete_layer_sql = "DELETE FROM layers WHERE ckan_id = %s"
+        if ckan_id is None :
+            return
+        try:
+            log.info('connecting to workspaces')
+            conn = psycopg2.connect("dbname=nasa-ace-web-prod user=workspace_default password=workspaceNasaAce")
+            cur = conn.cursor()
+            log.info('connected')
+            log.info('Deleting view layers for ckan_id : ' + ckan_id)
+            cur.execute(delete_view_layer_sql, (ckan_id,))
+            log.info('Deleting layers for ckan_id : ' + ckan_id)
+            cur.execute(delete_layer_sql, (ckan_id,))
+            conn.commit()
+            log.info('Layer deletion complete')
+            cur.close()
+        except (Exception, psycopg2.DatabaseError) as error:
+            log.error(error)
+        finally:
+            if conn is not None:
+                conn.close()
+
