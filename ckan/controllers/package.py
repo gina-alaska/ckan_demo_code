@@ -1613,9 +1613,9 @@ class PackageController(base.BaseController):
     def update_workspaces_layers(self, ckan_id, data=None):
         # TODO: Expand the functionality and make this a plugin
         log.info('Trying to insert resource into workspaces')
-        select_sql = "SELECT 1 FROM layers WHERE ckan_id = %s"
-        insert_sql = "INSERT INTO layers (name, category_id, url, created_at, updated_at, ckan_id) values (%s, %s, %s, now(), now(), %s)"
-        update_sql = "UPDATE layers SET name = %s, category_id = %s, url = %s, updated_at = now() WHERE ckan_id = %s"
+        select_sql = "SELECT 1 FROM layers WHERE ckan_resource_id = %s"
+        insert_sql = "INSERT INTO layers (name, category_id, url, created_at, updated_at, ckan_id, ckan_resource_id) values (%s, %s, %s, now(), now(), %s, %s)"
+        update_sql = "UPDATE layers SET name = %s, category_id = %s, url = %s, updated_at = now() WHERE ckan_resource_id = %s"
 	select_category_sql = "SELECT id FROM categories WHERE name ilike %s"
         # Sloppy query but will work for demo
         select_resource_id_sql = "SELECT id FROM resource WHERE created = (SELECT max(created) FROM resource)"
@@ -1657,7 +1657,7 @@ class PackageController(base.BaseController):
                     cur.execute(update_sql, (data['name'], category,  data['url'], ckan_id))
                 else :
                     log.info('executing insert ')
-                    cur.execute(insert_sql, (data['name'], category, data['url'], ckan_id))
+                    cur.execute(insert_sql, (data['name'], category, data['url'], data['package_id'], ckan_id))
                 conn.commit()
                 log.info('workspace layer for ' + data['name'] + ' updated')
             else :
